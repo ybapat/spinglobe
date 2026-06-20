@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -32,18 +35,34 @@ func main() {
 		)
 	}
 
+	// Prometheus registry — isolated from the default global registry so tests
+	// can spin up multiple instances without label collisions.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	m := newMetrics(reg)
+
 	table := buildRoutingTable(cfg.Routes, cfg.CBErrorThreshold, cfg.CBCooldown)
 	proxyHandler := NewProxyHandler(table, cfg, logger)
-	rateLimiter := NewRateLimiter(rdb, cfg.RateLimitFailOpen, logger)
+	rateLimiter := NewRateLimiter(rdb, cfg.RateLimitFailOpen, logger, m)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)
+	mux.Handle("/metrics", MetricsHandler(reg))
 
-	// Middleware chain: RequestLogger → JWTAuth → RateLimiter → ProxyHandler
-	chain := requestLogger(logger)(
-		JWTAuthMiddleware(cfg.JWTSecret, logger)(
-			rateLimiter.Middleware(cfg)(
-				proxyHandler,
+	// Admin API — hot-reload routes and inspect gateway state (no auth middleware).
+	admin := NewAdminHandler(table, cfg, logger)
+	mux.Handle("/admin/", admin)
+
+	// Main middleware chain:
+	// Metrics instrumentation → RequestLogger → X-Request-ID → JWTAuth → RateLimiter → ProxyHandler
+	chain := m.instrumentedMiddleware()(
+		requestLogger(logger)(
+			requestIDMiddleware()(
+				JWTAuthMiddleware(cfg.JWTSecret, logger)(
+					rateLimiter.Middleware(cfg)(
+						proxyHandler,
+					),
+				),
 			),
 		),
 	)
@@ -88,8 +107,8 @@ func healthzHandler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, "ok")
 }
 
-// requestLogger is a middleware that emits a structured JSON log line per request,
-// including latency, status code, method, path, and client IP.
+// requestLogger emits a structured JSON log line per request including the
+// X-Request-ID so logs can be correlated across the middleware chain.
 func requestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +129,7 @@ func requestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 				zap.Duration("latency", time.Since(start)),
 				zap.String("remote_addr", r.RemoteAddr),
 				zap.String("user_agent", r.UserAgent()),
+				zap.String("request_id", r.Header.Get("X-Request-ID")),
 				zap.String("tier", fromContext(r.Context(), ctxKeyTier)),
 				zap.String("subject", fromContext(r.Context(), ctxKeySubject)),
 			)
@@ -117,8 +137,32 @@ func requestLogger(logger *zap.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// connectRedis parses redisURL and pings the server. Returns nil client on failure —
-// callers must handle nil gracefully (rate limiter does via local fallback).
+// requestIDMiddleware generates a unique X-Request-ID for every inbound request
+// (or preserves an existing one from an upstream caller) and echoes it in the
+// response headers so clients can correlate logs.
+func requestIDMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id := r.Header.Get("X-Request-ID")
+			if id == "" {
+				id = newRequestID()
+				r.Header.Set("X-Request-ID", id)
+			}
+			w.Header().Set("X-Request-ID", id)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// newRequestID returns a 16-byte cryptographically random hex string.
+func newRequestID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// connectRedis parses redisURL and pings the server. Returns the client even on
+// ping failure so the caller can decide whether to use local fallback.
 func connectRedis(redisURL string) (*redis.Client, error) {
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {

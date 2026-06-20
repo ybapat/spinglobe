@@ -95,17 +95,19 @@ type RateLimiter struct {
 	scriptSHA string // SHA of the loaded Lua script
 	failOpen  bool
 	logger    *zap.Logger
+	metrics   *gatewayMetrics
 
 	localBuckets sync.Map // map[string]*localBucket
 }
 
 // NewRateLimiter connects to Redis, loads the Lua script, and returns a RateLimiter.
 // A connection failure is not fatal here — the limiter will operate in local-fallback mode.
-func NewRateLimiter(rdb *redis.Client, failOpen bool, logger *zap.Logger) *RateLimiter {
+func NewRateLimiter(rdb *redis.Client, failOpen bool, logger *zap.Logger, m *gatewayMetrics) *RateLimiter {
 	rl := &RateLimiter{
 		rdb:      rdb,
 		failOpen: failOpen,
 		logger:   logger,
+		metrics:  m,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -156,6 +158,9 @@ func (rl *RateLimiter) Middleware(cfg Config) func(http.Handler) http.Handler {
 					zap.String("key", bucketKey),
 					zap.String("path", r.URL.Path),
 				)
+				if rl.metrics != nil {
+					rl.metrics.ObserveRateLimit(tier)
+				}
 				w.Header().Set("Retry-After", strconv.FormatInt(reset-time.Now().Unix(), 10))
 				http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 				return
@@ -184,6 +189,9 @@ func (rl *RateLimiter) check(
 			zap.String("key", key),
 			zap.Error(err),
 		)
+		if rl.metrics != nil {
+			rl.metrics.ObserveRedisError()
+		}
 		return rl.localCheck(key, limits)
 	}
 
