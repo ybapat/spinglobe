@@ -1,0 +1,261 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ConfigMap — non-sensitive gateway settings
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spinglobe-config
+  namespace: default
+  labels:
+    app: spinglobe
+data:
+  GATEWAY_PORT: "8080"
+  REDIS_URL: "redis://spinglobe-redis:6379"
+  RATE_LIMIT_FAIL_OPEN: "true"
+  CB_ERROR_THRESHOLD: "0.10"
+  CB_COOLDOWN_SECONDS: "30"
+  MAX_RETRIES: "3"
+  RETRY_BASE_MS: "50"
+  TIER_FREE_CAPACITY: "10"
+  TIER_FREE_RPS: "10"
+  TIER_PREMIUM_CAPACITY: "100"
+  TIER_PREMIUM_RPS: "100"
+  TIER_ENTERPRISE_CAPACITY: "1000"
+  TIER_ENTERPRISE_RPS: "1000"
+  # JSON array of {prefix, backends[]} — edit to match your topology.
+  ROUTES_JSON: |
+    [
+      {"prefix": "/api/v1/", "backends": ["http://service-a:8080", "http://service-a-2:8080"]},
+      {"prefix": "/api/v2/", "backends": ["http://service-b:8080"]}
+    ]
+
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Secret — sensitive credentials (base64-encoded values)
+# In production, use External Secrets Operator or Vault Agent injector.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spinglobe-secrets
+  namespace: default
+  labels:
+    app: spinglobe
+type: Opaque
+stringData:
+  JWT_SECRET: "change-me-in-production-use-a-32-byte-random-string"
+
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Deployment
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spinglobe
+  namespace: default
+  labels:
+    app: spinglobe
+    version: "1.0.0"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spinglobe
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # zero-downtime rollouts
+  template:
+    metadata:
+      labels:
+        app: spinglobe
+        version: "1.0.0"
+      annotations:
+        prometheus.io/scrape: "false"  # flip to true when metrics endpoint is added
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: spinglobe
+          image: spinglobe:latest        # replace with your registry path
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Non-sensitive config from ConfigMap
+            - name: GATEWAY_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: GATEWAY_PORT
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: REDIS_URL
+            - name: RATE_LIMIT_FAIL_OPEN
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: RATE_LIMIT_FAIL_OPEN
+            - name: CB_ERROR_THRESHOLD
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: CB_ERROR_THRESHOLD
+            - name: CB_COOLDOWN_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: CB_COOLDOWN_SECONDS
+            - name: MAX_RETRIES
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: MAX_RETRIES
+            - name: RETRY_BASE_MS
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: RETRY_BASE_MS
+            - name: TIER_FREE_CAPACITY
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_FREE_CAPACITY
+            - name: TIER_FREE_RPS
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_FREE_RPS
+            - name: TIER_PREMIUM_CAPACITY
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_PREMIUM_CAPACITY
+            - name: TIER_PREMIUM_RPS
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_PREMIUM_RPS
+            - name: TIER_ENTERPRISE_CAPACITY
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_ENTERPRISE_CAPACITY
+            - name: TIER_ENTERPRISE_RPS
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: TIER_ENTERPRISE_RPS
+            - name: ROUTES_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: spinglobe-config
+                  key: ROUTES_JSON
+            # Sensitive credentials from Secret
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: spinglobe-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+            successThreshold: 1
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                # Allow in-flight requests to drain before SIGTERM arrives.
+                command: ["/bin/sh", "-c", "sleep 5"]
+      topologySpreadConstraints:
+        # Spread pods across availability zones for HA.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: spinglobe
+
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Service — ClusterIP (add LoadBalancer or Ingress in front for external access)
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: spinglobe
+  namespace: default
+  labels:
+    app: spinglobe
+spec:
+  type: ClusterIP
+  selector:
+    app: spinglobe
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# HorizontalPodAutoscaler — scale on CPU; stabilise scale-down to avoid thrash
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: spinglobe-hpa
+  namespace: default
+  labels:
+    app: spinglobe
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: spinglobe
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30     # react to CPU spikes within 30 s
+      policies:
+        - type: Pods
+          value: 4
+          periodSeconds: 60             # add up to 4 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 120   # wait 2 min before scaling down
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60             # remove at most 2 pods per minute
